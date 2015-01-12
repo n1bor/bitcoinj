@@ -25,7 +25,7 @@ public class LevelDbFullPrunedBlockChainTest extends AbstractFullPrunedBlockChai
 
     private void deleteFiles() {
         File f=new File("test-leveldb");
-        if(f!=null){
+        if(f!=null && f.exists()){
 	        for (File c : f.listFiles())
 	        	c.delete();
         }
