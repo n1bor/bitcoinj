@@ -8,10 +8,13 @@ import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.io.*;
+import java.nio.ByteBuffer;
 
 import org.bitcoinj.core.Address;
 import org.bitcoinj.core.AddressFormatException;
 import org.bitcoinj.core.NetworkParameters;
+import org.bitcoinj.core.ScriptException;
 import org.bitcoinj.core.Sha256Hash;
 import org.bitcoinj.core.StoredBlock;
 import org.bitcoinj.core.StoredUndoableBlock;
@@ -22,48 +25,85 @@ import org.bitcoinj.core.UTXOProviderException;
 import org.bitcoinj.core.VerificationException;
 import org.bitcoinj.script.Script;
 import org.iq80.leveldb.*;
-
-import com.google.common.collect.Lists;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import static org.iq80.leveldb.impl.Iq80DBFactory.*;
 
-import java.io.*;
-import java.nio.ByteBuffer;
+import com.google.common.collect.Lists;
 
-import javax.annotation.Nullable;
+/**
+ * 
+ * <p>An implementation of a Fully Pruned Block Store using a Pure Java leveldb
+ * implementation as the backing data store.<p>
+ * 
+ * <p>Includes number of caches to optimise the initial blockchain download</p> 
+ *  
+ *
+ */
+
 
 public class LevelDbFullPrunedBlockStore implements FullPrunedBlockStore {
+	private static final Logger log = LoggerFactory.getLogger(LevelDbFullPrunedBlockStore.class);
+	
 	NetworkParameters params;
+
+	//LevelDB reference.
 	DB db=null;
 	
-    
+	//Standard blockstore properties
     protected Sha256Hash chainHeadHash;
     protected StoredBlock chainHeadBlock;
     protected Sha256Hash verifiedChainHeadHash;
     protected StoredBlock verifiedChainHeadBlock;
     protected int fullStoreDepth;
+    //Indicates if we track and report runtime for each method
+    //this is very useful to focuse performance tuning on correct areas.
     protected boolean instrument=false;
+    //instrumentation stats
     long wallTimeStart;
-    protected Map<ByteBuffer,UTXO> utxoCache;
-    protected Map<ByteBuffer,UTXO> utxoUncommitedCache;
-    protected Set<ByteBuffer> utxoUncommitedDeletedCache;
     protected long hit;
     protected long miss;
+	Map<String,Long> methodStartTime;
+	Map<String,Long> methodCalls;
+	Map<String,Long> methodTotalTime;
+	int exitBlock; //Must be multiple of 1000 and causes code to exit at this block!
+	//ONLY used for performance benchmarking.
+    
+    //LRU Cache for getTransactionOutput 
+    protected Map<ByteBuffer,UTXO> utxoCache;
+    //Additional cache to cope with case when transactions are rolled back
+    //e.g. when block fails to verify.
+    protected Map<ByteBuffer,UTXO> utxoUncommittedCache;
+    protected Set<ByteBuffer> utxoUncommittedDeletedCache;
+    
+    //Database folder
     protected String filename;
     
+    //Do we auto commit transactions.
     protected boolean autoCommit=true;
     
+    //Datastructures to allow us to search for uncommited inserts/deletes.
+    //leveldb (or at least this one) does not support dirty reads so we have to
+    //do it ourselves.
 	Map<ByteBuffer, byte[]> uncommited;
 	Set<ByteBuffer> uncommitedDeletes;
 	
+	//Sizes of leveldb caches.
 	protected long leveldbReadCache;
 	protected int leveldbWriteCache;
-	protected int openOutCache;
 	
+	//Size of cache for getTransactionOutput
+	protected int openOutCache;
+	//Bloomfilter for caching calls to hasUnspentOutputs
+	protected BloomFilter bloom;
+	
+	//Defaults for cache sizes
 	static final long LEVELDB_READ_CACHE_DEFAULT=100 * 1048576; //100 meg
 	static final int LEVELDB_WRITE_CACHE_DEFAULT=10 * 1048576; //10 meg
 	static final int OPENOUT_CACHE_DEFAULT=100000; 
     
+	//LRUCache
     public class LRUCache extends LinkedHashMap<ByteBuffer,UTXO> {
     	   private static final long serialVersionUID = 1L;
     	   private int capacity;
@@ -77,54 +117,151 @@ public class LevelDbFullPrunedBlockStore implements FullPrunedBlockStore {
     	   }
     	}
     
+    
+    //Simple bloomfilter. We take advantage of fact that a Transaction Hash
+    //can be split into 3 30bit numbers that are all random and uncorrelated
+    //so idea to use as the input to a 3 function bloomfilter.
+    private class BloomFilter {
+    	private byte[] cache;
+    	public long returnedTrue;
+    	public long returnedFalse;
+    	public long added;
+    	public BloomFilter(){
+    		//2^27 so since 8 bits in a byte this is
+    		// 1,073,741,824 bits
+    		cache=new byte[134217728];
+    		//This size chosen as with 3 functions we should only get 4% errors with 150m entries.
+    	}
+    	
+    	//Called to prime cache.
+    	//Might be idea to call periodically to flush out removed keys.
+    	//Would need to benchmark 1st though.
+    	public void reloadCache(DB db){
+    		//LevelDB is great at scanning consecutive keys.
+    		//This take seconds even with 20m keys to add.
+    		log.info("Loading Bloom Filter");
+			DBIterator iterator = db.iterator();
+			byte[] key=getKey(KeyType.OPENOUT_ALL);
+			for(iterator.seek(key);iterator.hasNext(); iterator.next()) {
+				ByteBuffer bbKey=ByteBuffer.wrap(iterator.peekNext().getKey());
+				byte firstByte=bbKey.get(); //remove the address_hashindex byte.
+				if(key[0]!=firstByte){
+					printStat();
+					return;
+				}
+					
+				byte[] hash=new byte[32];
+				bbKey.get(hash);
+				add(hash);
+			}
+			printStat();
+    	}
+    	public void printStat(){
+    		log.info("Bloom Added: "+added+" T: "+returnedTrue+" F: "+returnedFalse);
+    	}
+    	
+    	//Add a txhash to the filter.
+    	public void add(byte[]  hash){
+    		byte[] firstHash=new byte[4];
+    		added++;
+    		for(int i=0;i<3;i++){
+    			System.arraycopy(hash, i*4, firstHash, 0, 4);
+        		setBit(firstHash);	
+    		}
+    	}
+    	public void add(Sha256Hash  hash){
+    		add(hash.getBytes());
+    	}
+    	
+    	//check if hash was added.
+    	//if returns false then 100% sure never added
+    	//if returns true need to check what state is in DB and can 
+    	//not be 100% sure.
+    	public boolean wasAdded(Sha256Hash  hash){
+
+    		byte[] firstHash=new byte[4];
+    		for(int i=0;i<3;i++){
+    			System.arraycopy(hash.getBytes(), i*4, firstHash, 0, 4);
+        		boolean result=getBit(firstHash);
+        		if (!result){
+        			returnedFalse++;
+        			return false;
+        		}
+    		}
+    		returnedTrue++;
+    		return true;
+    	}
+    	
+    	private void setBit(byte[] entry){
+    	     int arrayIndex=(entry[0]& 0x3F )<< 21 | (entry[1] & 0xFF) << 13 | (entry[2] & 0xFF)<< 5 | (entry[3] & 0xFF)>>3;
+    	     int bit=(entry[3] & 0x07);
+    	     int orBit=(0x1<<bit);
+    	     byte newEntry=(byte)((int)cache[arrayIndex] | orBit);
+    	     cache[arrayIndex]=newEntry;
+    	}
+    	
+    	private boolean getBit(byte[] entry){
+   	     	int arrayIndex=(entry[0]& 0x3F )<< 21 | (entry[1] & 0xFF) << 13 | (entry[2] & 0xFF)<< 5 | (entry[3] & 0xFF)>>3;
+   	     	int bit=(entry[3] & 0x07);
+   	     	int orBit=(0x1<<bit);
+   	     	byte arrayEntry=cache[arrayIndex];
+
+   	     	int result=arrayEntry & orBit;
+   	     	if(result==0){
+   	     		return false;
+   	     		
+   	     	}else{
+   	     		return true;
+   	     	}
+   	    }
+    }
+    
+    
+    
     public LevelDbFullPrunedBlockStore(NetworkParameters params, String filename, int blockCount){
     	this(params,filename,blockCount,LEVELDB_READ_CACHE_DEFAULT,LEVELDB_WRITE_CACHE_DEFAULT,
-    			OPENOUT_CACHE_DEFAULT,false);
+    			OPENOUT_CACHE_DEFAULT,false,Integer.MAX_VALUE);
 
     }
     
-
+    
 
 	public LevelDbFullPrunedBlockStore(NetworkParameters params, String filename, int blockCount,
-			long leveldbReadCache, int leveldbWriteCache, int openOutCache, boolean instrument){
+			long leveldbReadCache, int leveldbWriteCache, int openOutCache, boolean instrument,int exitBlock){
 		this.params=params;
 		fullStoreDepth=blockCount;
 		this.instrument=instrument;
+		this.exitBlock=exitBlock;
 		methodStartTime=new HashMap<String,Long>();
 		methodCalls=new HashMap<String,Long>();
 		methodTotalTime=new HashMap<String,Long>();
 		wallTimeStart=System.nanoTime();
-		utxoCache=new LRUCache(openOutCache,0.75f);
+		
 		this.filename=filename;
     	this.leveldbReadCache=leveldbReadCache;
     	this.leveldbWriteCache=leveldbWriteCache;
     	this.openOutCache=openOutCache;
+		bloom=new BloomFilter();
 		
-
 		openDB();
+		bloom.reloadCache(db);
 	}
 	
 	private void openDB(){
 		Options options = new Options();
 		options.createIfMissing(true);
 		
-		Logger logger = new Logger() {
-			  public void log(String message) { 
-			    System.out.println(message);
-			  }
-		};
-		options.logger(logger);
 		options.cacheSize(leveldbReadCache); 
 		options.writeBufferSize(leveldbWriteCache);
 
 		try {
 			db = factory.open(new File(filename), options);
 		} catch (IOException e) {
-			// TODO Auto-generated catch block
 			e.printStackTrace();
+			throw new RuntimeException("Can not open DB");
 		}
-		//String stats = batchGetProperty("leveldb.stats");
-		//System.out.println(stats);
+		
+		utxoCache=new LRUCache(openOutCache,0.75f);
 		try {
 			if(batchGet(getKey(KeyType.CREATED))==null) {
 					createNewStore(params);
@@ -132,9 +269,8 @@ public class LevelDbFullPrunedBlockStore implements FullPrunedBlockStore {
 					initFromDb();
 			}
 		} catch (BlockStoreException e) {
-			// TODO Auto-generated catch block
 			e.printStackTrace();
-			//????
+			throw new RuntimeException("Can not init/load db");
 		}
 	}
 	
@@ -176,9 +312,7 @@ public class LevelDbFullPrunedBlockStore implements FullPrunedBlockStore {
         }
     }
 
-	Map<String,Long> methodStartTime;
-	Map<String,Long> methodCalls;
-	Map<String,Long> methodTotalTime;
+
 	void beginMethod(String name){
 		methodStartTime.put(name, System.nanoTime());
 	}
@@ -194,6 +328,8 @@ public class LevelDbFullPrunedBlockStore implements FullPrunedBlockStore {
 		}
 	}
 	
+	//Debug method to display stats on runtime of each method
+	//and cache hit rates etc..
 	void dumpStats(){
 		long wallTime=System.nanoTime()-wallTimeStart;
 		long dbtime=0;
@@ -203,23 +339,22 @@ public class LevelDbFullPrunedBlockStore implements FullPrunedBlockStore {
 			dbtime+=time;
 			long average=time/calls;
 			double proportion=(time+0.0)/(wallTime+0.0);
-			System.out.println(name+" c:"+calls+" r:"+time+" a:"+average+" p:"+String.format( "%.2f", proportion ));
+			log.info(name+" c:"+calls+" r:"+time+" a:"+average+" p:"+String.format( "%.2f", proportion ));
+			
 		}
 		double dbproportion=(dbtime+0.0)/(wallTime+0.0);
 		double hitrate=(hit+0.0)/(hit+miss+0.0);
-		//System.out.println("Cache size:"+utxoCache.size()+" hit:"+hit+" miss:"+miss+" rate:"+String.format( "%.2f", hitrate ));
-		System.out.println("Wall:"+wallTime+" percent:"+String.format( "%.2f", dbproportion ));
-		
+		log.info("Cache size:"+utxoCache.size()+" hit:"+hit+" miss:"+miss+" rate:"+String.format( "%.2f", hitrate ));
+		bloom.printStat();
+		log.info("hasTxOut call:"+hasCall+" True:"+hasTrue+" False:"+hasFalse);
+		log.info("Wall:"+wallTime+" percent:"+String.format( "%.2f", dbproportion ));
 		
 	}
 	
 	@Override
 	public void put(StoredBlock block) throws BlockStoreException {
 		putUpdateStoredBlock(block, false);
-
 	}
-
-
 
 	@Override
 	public StoredBlock getChainHead() throws BlockStoreException {
@@ -228,23 +363,19 @@ public class LevelDbFullPrunedBlockStore implements FullPrunedBlockStore {
 
 	@Override
 	public void setChainHead(StoredBlock chainHead) throws BlockStoreException {
-		// TODO Auto-generated method stub
 		if(instrument) beginMethod("setChainHead");
         Sha256Hash hash = chainHead.getHeader().getHash();
         this.chainHeadHash = hash;
         this.chainHeadBlock = chainHead;
         batchPut(getKey(KeyType.CHAIN_HEAD_SETTING), hash.getBytes());
-		
         if(instrument) endMethod("setChainHead");
 	}
 
 	@Override
 	public void close() throws BlockStoreException {
-		// TODO Auto-generated method stub
 		try {
 			db.close();
 		} catch (IOException e) {
-			// TODO Auto-generated catch block
 			e.printStackTrace();
 			throw new BlockStoreException("Could not close db");
 		}
@@ -252,21 +383,27 @@ public class LevelDbFullPrunedBlockStore implements FullPrunedBlockStore {
 
 	@Override
 	public NetworkParameters getParams() {
-		// TODO Auto-generated method stub
 		return params;
 	}
 
 	@Override
 	public List<UTXO> getOpenTransactionOutputs(List<Address> addresses)
 			throws UTXOProviderException {
+		//Run this on a snapshot of database so internally consistent result
+		//This is critical or if one address paid another could get incorrect results
+		
 		List<UTXO> results=new LinkedList<UTXO>();
 		for(Address a:addresses){
 			ByteBuffer bb=ByteBuffer.allocate(21);		
 			bb.put((byte)KeyType.ADDRESS_HASHINDEX.ordinal());
 			bb.put(a.getHash160());
+			
+			ReadOptions ro = new ReadOptions();
+			ro.snapshot(db.getSnapshot());
 
+			//Scanning over iterator very fast
 
-			DBIterator iterator = db.iterator();
+			DBIterator iterator = db.iterator(ro);
 			for(iterator.seek(bb.array()); iterator.hasNext(); iterator.next()) {
 				ByteBuffer bbKey=ByteBuffer.wrap(iterator.peekNext().getKey());
 				bbKey.get(); //remove the address_hashindex byte.
@@ -281,8 +418,9 @@ public class LevelDbFullPrunedBlockStore implements FullPrunedBlockStore {
 				Sha256Hash hash=new Sha256Hash(hashBytes);
 				UTXO txout;
 				try {
+					//TODO this should be on the SNAPSHOT too......
+					//this is really a BUG.
 					txout=getTransactionOutput(hash,index);
-					
 				} catch (BlockStoreException e) {
 					e.printStackTrace();
 					throw new UTXOProviderException("block store execption");
@@ -304,11 +442,10 @@ public class LevelDbFullPrunedBlockStore implements FullPrunedBlockStore {
 				
 			}
 		}
-		
 		return results;
 	}
 
-    private Script.ScriptType getScriptType(@Nullable Script script) {
+    private Script.ScriptType getScriptType(Script script) {
         if (script != null) {
             return script.getScriptType();
         }
@@ -318,22 +455,20 @@ public class LevelDbFullPrunedBlockStore implements FullPrunedBlockStore {
 	
 	@Override
 	public int getChainHeadHeight() throws UTXOProviderException {
-		// TODO Auto-generated method stub
-        try {
+		try {
             return getVerifiedChainHead().getHeight();
         } catch (BlockStoreException e) {
             throw new UTXOProviderException(e);
         }
 	}
     protected void putUpdateStoredBlock(StoredBlock storedBlock, boolean wasUndoable) {
+    	//We put as one record as then the get is much faster.
     	if(instrument) beginMethod("putUpdateStoredBlock");
     	Sha256Hash hash=storedBlock.getHeader().getHash();
     	ByteBuffer bb=ByteBuffer.allocate(97);
     	storedBlock.serializeCompact(bb);
     	bb.put((byte)(wasUndoable?1:0));
     	batchPut(getKey(KeyType.HEADERS_ALL,hash),bb.array());
-    	System.out.println("block "+hash.toString());
-    	
     	if(instrument) endMethod("putUpdateStoredBlock");
     }
 
@@ -392,6 +527,9 @@ public class LevelDbFullPrunedBlockStore implements FullPrunedBlockStore {
         
 	}
 	
+	//Since LevelDB is a key value store we do not have "tables".
+	//So these keys are the 1st byte of each key to indicate the "table" it is in.
+	//Do wonder if grouping each "table" like this is efficient or not...
 	enum KeyType {
 		CREATED,
 		CHAIN_HEAD_SETTING,
@@ -402,9 +540,9 @@ public class LevelDbFullPrunedBlockStore implements FullPrunedBlockStore {
 		HEIGHT_UNDOABLEBLOCKS,
 		OPENOUT_ALL,
 		ADDRESS_HASHINDEX
-	
 	}
 
+	//These helpers just get the key for an input
 	private byte[] getKey(KeyType keytype){
 		byte[] key=new byte[1];
 		key[0]=(byte)keytype.ordinal();
@@ -462,7 +600,7 @@ public class LevelDbFullPrunedBlockStore implements FullPrunedBlockStore {
 	        if (verifiedChainHeadHash != null && verifiedChainHeadHash.equals(hash))
 	            return verifiedChainHeadBlock;
 	        
-	        if(instrument) beginMethod("get");
+	        if(instrument) beginMethod("get");//ignore optimised case as not interesting for tuning.
 	        boolean undoableResult;
 
 			byte[] result=batchGet(getKey(KeyType.HEADERS_ALL,hash));
@@ -475,6 +613,7 @@ public class LevelDbFullPrunedBlockStore implements FullPrunedBlockStore {
             	if(instrument) endMethod("get");
                 return null;
             }
+            //TODO Should I chop the last byte off? Seems to work with it left there...
             StoredBlock stored= StoredBlock.deserializeCompact(params,ByteBuffer.wrap(result));
             stored.getHeader().verifyHeader();
 
@@ -497,7 +636,7 @@ public class LevelDbFullPrunedBlockStore implements FullPrunedBlockStore {
 	        	return null;
 	        }
 	        ByteBuffer bb=ByteBuffer.wrap(result);
-	        int height=bb.getInt();
+	        bb.getInt();//TODO Read height - but seems to be unused - maybe can skip storing it but only 4 bytes! 
 	        int txOutSize=bb.getInt();
 	        
 	        StoredUndoableBlock block;
@@ -543,18 +682,23 @@ public class LevelDbFullPrunedBlockStore implements FullPrunedBlockStore {
 			
 			UTXO result=null;
 			byte[] key=getTxKey(KeyType.OPENOUT_ALL,hash,(int)index);
+			//Use cache
 			if(autoCommit){
+				//Simple case of auto commit on so cache is consistent.
 				result=utxoCache.get(ByteBuffer.wrap(key));
 			}else{
-				if(utxoUncommitedDeletedCache.contains(ByteBuffer.wrap(key))){
+				//Check if we have an uncommitted delete.
+				if(utxoUncommittedDeletedCache.contains(ByteBuffer.wrap(key))){
 					//has been deleted so return null;
 					hit++;
 					if(instrument) endMethod("getTransactionOutput");
 					return result;
 				}
-				result=utxoUncommitedCache.get(ByteBuffer.wrap(key));
+				//Check if we have an uncommitted entry
+				result=utxoUncommittedCache.get(ByteBuffer.wrap(key));
 				if(result==null)
 					result=utxoCache.get(ByteBuffer.wrap(key));
+				//And lastly above check if we have a committed cached entry 
 				
 			}
 			if(result!=null){
@@ -563,6 +707,7 @@ public class LevelDbFullPrunedBlockStore implements FullPrunedBlockStore {
 				return result;
 			}
 			miss++;
+			//If we get here have to hit the database.
 			byte[] inbytes =batchGet(key);
 			if (inbytes==null){
 				if(instrument) endMethod("getTransactionOutput");
@@ -575,11 +720,9 @@ public class LevelDbFullPrunedBlockStore implements FullPrunedBlockStore {
 	        if(instrument) endMethod("getTransactionOutput");
 	        return txout;
 		} catch (DBException e) {
-			// TODO Auto-generated catch block
 			e.printStackTrace();
 			if(instrument) endMethod("getTransactionOutput");
 		} catch (IOException e) {
-			// TODO Auto-generated catch block
 			e.printStackTrace();
 			if(instrument) endMethod("getTransactionOutput");
 		}
@@ -591,29 +734,32 @@ public class LevelDbFullPrunedBlockStore implements FullPrunedBlockStore {
 			throws BlockStoreException {
 
 		if(instrument) beginMethod("addUnspentTransactionOutput");
-		
-		
+
+		//Add to bloom filter - is very fast to add.
+		bloom.add(out.getHash());
 		ByteArrayOutputStream bos = new ByteArrayOutputStream();
 		try {
 			out.serializeToStream(bos);
 		} catch (IOException e) {
-			// TODO Auto-generated catch block
 			e.printStackTrace();
 			throw new BlockStoreException("problem serialising utxo");
 		}
 		
 	
 		byte[] key=getTxKey(KeyType.OPENOUT_ALL,out.getHash(),(int)out.getIndex());
-		System.out.println("Tx: "+out.getHash().toString()+":"+out.getIndex());
 		batchPut(key,bos.toByteArray());
+		
 		if(autoCommit){
 			utxoCache.put(ByteBuffer.wrap(key), out);
 		} else{
-			utxoUncommitedCache.put(ByteBuffer.wrap(key), out);
-			utxoUncommitedDeletedCache.remove(ByteBuffer.wrap(key));
+			utxoUncommittedCache.put(ByteBuffer.wrap(key), out);
+			//leveldb just stores the last key/value added.
+			//So if we do an add must remove any previous deletes.
+			utxoUncommittedDeletedCache.remove(ByteBuffer.wrap(key));
 		}
 		
 		//Could run this in parallel with above too.
+		//Should update instrumentation to see if worth while.
 		Address a;
 		if(out.getAddress()==null || out.getAddress().equals("")){
 			if(instrument) endMethod("addUnspentTransactionOutput");
@@ -622,7 +768,6 @@ public class LevelDbFullPrunedBlockStore implements FullPrunedBlockStore {
 			try {
 				a=new Address(params, out.getAddress());
 			} catch (AddressFormatException e) {
-				// TODO Auto-generated catch block
 				if(instrument) endMethod("addUnspentTransactionOutput");
 				return;
 			}
@@ -640,9 +785,10 @@ public class LevelDbFullPrunedBlockStore implements FullPrunedBlockStore {
 	private void batchPut(byte[] key,byte[] value){
 		if(autoCommit){
 			db.put(key,value);
-		}else{	
+		}else{
+			//Add this so we can get at uncommitted inserts which
+			//leveldb does not support
 			uncommited.put(ByteBuffer.wrap(key), value);
-			//System.out.println("uncom: "+uncommited.size());
 			batch.put(key,value);
 		}	
 	}
@@ -650,13 +796,11 @@ public class LevelDbFullPrunedBlockStore implements FullPrunedBlockStore {
 		ByteBuffer bbKey=ByteBuffer.wrap(key);
 		
 		// This is needed to cope with deletes that are not yet committed to db.
-		// not 100% sure about this - really needs some test case as will never
-		// be run on normal block - only one with double spends in it.
 		if(!autoCommit && uncommitedDeletes!=null && uncommitedDeletes.contains(bbKey))
 			return null;
 		
 		byte[] value=null;
-		
+		//And this to handle uncommitted inserts (dirty reads)
 		if(!autoCommit && uncommited !=null ){
 			value=uncommited.get(bbKey);
 			if(value!=null)
@@ -682,34 +826,44 @@ public class LevelDbFullPrunedBlockStore implements FullPrunedBlockStore {
 	public void removeUnspentTransactionOutput(UTXO out)
 			throws BlockStoreException {
 		if(instrument) beginMethod("removeUnspentTransactionOutput");
-
+		
 		byte[] key=getTxKey(KeyType.OPENOUT_ALL,out.getHash(),(int)out.getIndex());
 		
 		if(autoCommit){
 			utxoCache.remove(ByteBuffer.wrap(key));
 		} else {
-			utxoUncommitedDeletedCache.remove(ByteBuffer.wrap(key));
-			utxoUncommitedCache.remove(ByteBuffer.wrap(key));
+			utxoUncommittedDeletedCache.add(ByteBuffer.wrap(key));
+			utxoUncommittedCache.remove(ByteBuffer.wrap(key));
 		}
 		
 		batchDelete(key);
 		//could run this and the above in parallel
+		//Need to update instrumentation to check if worth the effort
+		
+		//TODO storing as byte[] hash to save space. But think should just
+		// store as String of address. Might be faster. Need to test.
 		ByteBuffer bb=ByteBuffer.allocate(57);		
 		Address a;
+		byte[] hashBytes=null;
 		try {
 			String address=out.getAddress();
 			if(address==null || address.equals("")){
-				if(instrument) endMethod("removeUnspentTransactionOutput");
-				return;
+				Script sc=new Script(out.getScriptBytes());
+				a=sc.getToAddress(params);
+				hashBytes=a.getHash160();
+			} else {
+				a=new Address(params, out.getAddress());
+				hashBytes=a.getHash160();
 			}
-			a=new Address(params, out.getAddress());
 		} catch (AddressFormatException e) {
-			e.printStackTrace();
+			if(instrument) endMethod("removeUnspentTransactionOutput");
+			return;
+		}  catch (ScriptException e) {
 			if(instrument) endMethod("removeUnspentTransactionOutput");
 			return;
 		}
 		bb.put((byte)KeyType.ADDRESS_HASHINDEX.ordinal());
-		bb.put(a.getHash160());
+		bb.put(hashBytes);
 		bb.put(out.getHash().getBytes());
 		bb.putInt((int)out.getIndex());
 		batchDelete(bb.array());
@@ -718,11 +872,24 @@ public class LevelDbFullPrunedBlockStore implements FullPrunedBlockStore {
 		if(instrument) endMethod("removeUnspentTransactionOutput");
 	}
 
+	//Instrumentation of bloom filter to check theory
+	//matches reality. Without this initial chain sync takes
+	//50-75% longer.
+	long hasCall;
+	long hasTrue;
+	long hasFalse;
 	@Override
 	public boolean hasUnspentOutputs(Sha256Hash hash, int numOutputs)
 			throws BlockStoreException {
 		if(instrument) beginMethod("hasUnspentOutputs");
+		hasCall++;
+		if(!bloom.wasAdded(hash)){
+			if(instrument) endMethod("hasUnspentOutputs");
+			hasFalse++;
+			return false;
+		}
 		// no index is fine as will find any entry with any index...
+		// TODO should I be checking uncommitted inserts/deletes???
 		byte[] key=getTxKey(KeyType.OPENOUT_ALL,hash);
 		byte[] subResult=new byte[key.length];
 		DBIterator iterator = db.iterator();
@@ -731,12 +898,16 @@ public class LevelDbFullPrunedBlockStore implements FullPrunedBlockStore {
 			System.arraycopy(result, 0, subResult, 0, subResult.length);
 			if(Arrays.equals(key, subResult)){
 				if(instrument) endMethod("hasUnspentOutputs");
+				hasTrue++;
 				return true;
 			} else {
 				if(instrument) endMethod("hasUnspentOutputs");
+				hasFalse++;
 				return false;
 			}
 		}
+		if(instrument) endMethod("hasUnspentOutputs");
+		hasFalse++;
 		return false;
 		
 	}
@@ -771,7 +942,7 @@ public class LevelDbFullPrunedBlockStore implements FullPrunedBlockStore {
 			
 			byte[] bytekey=iterator.peekNext().getKey();
 			ByteBuffer buff=ByteBuffer.wrap(bytekey);
-			byte temp=buff.get();
+			buff.get(); //Just remove byte from buffer.
             int keyHeight=buff.getInt();
             
             byte[] hashbytes=new byte[32];
@@ -793,14 +964,10 @@ public class LevelDbFullPrunedBlockStore implements FullPrunedBlockStore {
 
 	@Override
 	public void beginDatabaseBatchWrite() throws BlockStoreException {
-		System.out.println("startComm");
+
+		//This is often called twice in row! But they are not nested transaction!
+		//We just ignore the second call.
 		if (!autoCommit){
-			/**if(uncommited!=null)
-				System.out.println("uncommiteds "+uncommited.size()+" del: "+uncommitedDeletes.size());
-			else
-				System.out.println("uncommiteds");
-				**/
-			//db.write(batch);
 			return;
 		}
 		if(instrument) beginMethod("beginDatabaseBatchWrite");
@@ -808,8 +975,8 @@ public class LevelDbFullPrunedBlockStore implements FullPrunedBlockStore {
 		batch = db.createWriteBatch();
 		uncommited= new HashMap<ByteBuffer, byte[]>();
 		uncommitedDeletes= new HashSet <ByteBuffer>();
-	    utxoUncommitedCache=new HashMap<ByteBuffer, UTXO>();
-	    utxoUncommitedDeletedCache = new HashSet<ByteBuffer>();
+		utxoUncommittedCache=new HashMap<ByteBuffer, UTXO>();
+	    utxoUncommittedDeletedCache = new HashSet<ByteBuffer>();
 		autoCommit=false;
 		if(instrument) endMethod("beginDatabaseBatchWrite");
 	}
@@ -817,25 +984,22 @@ public class LevelDbFullPrunedBlockStore implements FullPrunedBlockStore {
 	
 	@Override
 	public void commitDatabaseBatchWrite() throws BlockStoreException {
-		
-		//System.out.println("Commiting uncommiteds "+uncommited.size()+" del: "+uncommitedDeletes.size());
 		uncommited=null;
 		uncommitedDeletes=null;
-		//System.out.println("commit");
 		if(instrument) beginMethod("commitDatabaseBatchWrite");
 		
 		db.write(batch);
 		// order of these is not important as we only allow entry to be in one or the other.
-		
-		for (Map.Entry<ByteBuffer, UTXO> entry : utxoUncommitedCache.entrySet()){
+		// must update cache with uncommitted adds/deletes.
+		for (Map.Entry<ByteBuffer, UTXO> entry : utxoUncommittedCache.entrySet()){
 		 
 			utxoCache.put(entry.getKey(), entry.getValue());
 		}
-		utxoUncommitedCache=null;
-		for (ByteBuffer entry: utxoUncommitedDeletedCache){
+		utxoUncommittedCache=null;
+		for (ByteBuffer entry: utxoUncommittedDeletedCache){
 			utxoCache.remove(entry);
 		}
-		utxoUncommitedDeletedCache=null;
+		utxoUncommittedDeletedCache=null;
 		
 		autoCommit=true;
 		
@@ -843,18 +1007,18 @@ public class LevelDbFullPrunedBlockStore implements FullPrunedBlockStore {
 			batch.close();
 			batch=null;
 		} catch (IOException e) {
-			// TODO Auto-generated catch block
 			e.printStackTrace();
 			throw new BlockStoreException("could not close batch.");
 		}
 		
 		if(instrument) endMethod("commitDatabaseBatchWrite");
 		
-		if (verifiedChainHeadBlock.getHeight()%1000==0){
-			System.out.println(verifiedChainHeadBlock.getHeight());
+		if (instrument && verifiedChainHeadBlock.getHeight()%1000==0){
+			log.info("Height: "+verifiedChainHeadBlock.getHeight());
 			dumpStats();
-			if(verifiedChainHeadBlock.getHeight()==338000){
-				System.exit(1); //TODO REMOVE! JUST TO BENCHMARK
+			if(verifiedChainHeadBlock.getHeight()==exitBlock){
+				System.err.println("Exit due to exitBlock set");
+				System.exit(1);
 			}
 		}
 
@@ -863,11 +1027,12 @@ public class LevelDbFullPrunedBlockStore implements FullPrunedBlockStore {
 
 	@Override
 	public void abortDatabaseBatchWrite() throws BlockStoreException {
-		// TODO Auto-generated method stub
-		//System.out.println("abort");
+
 		try {
 			uncommited=null;
 			uncommitedDeletes=null;
+			utxoUncommittedCache=null;
+			utxoUncommittedDeletedCache=null;
 			autoCommit=true;
 			if(batch!=null){
 				batch.close();
@@ -875,7 +1040,6 @@ public class LevelDbFullPrunedBlockStore implements FullPrunedBlockStore {
 			}
 			
 		} catch (IOException e) {
-			// TODO Auto-generated catch block
 			e.printStackTrace();
 			throw new BlockStoreException("could not close batch in abort.");
 		}
@@ -883,14 +1047,16 @@ public class LevelDbFullPrunedBlockStore implements FullPrunedBlockStore {
 	
 
 	public void resetStore() {
+		// only used in unit tests.
+		// bit dangerous and deletes files!
 		try {
 			db.close();
 			uncommited=null;
 			uncommitedDeletes=null;
 			autoCommit=true;
+			bloom=new BloomFilter();
 			utxoCache=new LRUCache(openOutCache,0.75f);
 		} catch (IOException e) {
-			// TODO Auto-generated catch block
 			e.printStackTrace();
 		}
 		
@@ -901,7 +1067,4 @@ public class LevelDbFullPrunedBlockStore implements FullPrunedBlockStore {
 		  }
 		openDB();
 	}
-	
-	
-	
 }
