@@ -301,7 +301,14 @@
                 <version>2.12.4</version>
                 <configuration>
                     <argLine>${surefireArgLine}</argLine> <!-- This is required for code coverage to work. -->
-                </configuration>
+                  	<systemProperties>
+                  		<!-- This is added to reduce log output below 4Meg limit of Travis-CI -->
+           				<property> 
+             					<name>java.util.logging.config.file</name>
+             					<value>src/test/resources/logging.properties</value>
+           				</property>
+         			</systemProperties>
+              	</configuration>
             </plugin>
 
             <!-- Coveralls is a online code coverage tool, you can track code coverage here: https://coveralls.io/r/bitcoinj/bitcoinj -->
